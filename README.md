@@ -25,7 +25,17 @@ If the test is being run on Ubuntu version 16.04 LTS (the current long term rele
 executable s3-benchmark.ubuntu will run the benchmark testing without having to build the executable. 
 
 Otherwise, to build the s3-benchmark executable, you must issue this following command:
-/usr/bin/go build s3-bechmark.go
+
+cd /root/s3-benchmark
+export GO111MODULE=off
+export GOPATH=/root/gopath
+export PATH=$PATH:$GOPATH/bin:/root/go/bin
+
+go get -u github.com/aws/aws-sdk-go/aws/...
+go get -u github.com/aws/aws-sdk-go/service/...
+go get -u github.com/pivotal-golang/bytefmt/...
+
+go build
  
 # Command Line Arguments
 Below are the command line arguments to the program (which can be displayed using -help):

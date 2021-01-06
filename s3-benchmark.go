@@ -16,7 +16,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/pivotal-golang/bytefmt"
+	//"github.com/pivotal-golang/bytefmt"
+        "code.cloudfoundry.org/bytefmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -34,7 +35,7 @@ import (
 
 // Global variables
 var access_key, secret_key, url_host, bucket, region string
-var duration_secs, threads, loops int
+var duration_secs, threads, loops, num_ios, op_type int
 var object_size uint64
 var object_data []byte
 var object_data_md5 string
@@ -206,7 +207,8 @@ func setSignature(req *http.Request) {
 }
 
 func runUpload(thread_num int) {
-	for time.Now().Before(endtime) {
+        if (num_ios == 0) {
+	  for time.Now().Before(endtime) {
 		objnum := atomic.AddInt32(&upload_count, 1)
 		fileobj := bytes.NewReader(object_data)
 		prefix := fmt.Sprintf("%s/%s/Object-%d", url_host, bucket, objnum)
@@ -228,7 +230,33 @@ func runUpload(thread_num int) {
 				}
 			}
 		}
-	}
+	  }
+        } else {
+          for iter := 0; iter < num_ios; iter++  {
+                atomic.AddInt32(&upload_count, 1)
+                fileobj := bytes.NewReader(object_data)
+                prefix := fmt.Sprintf("%s/%s/Object-%d-%d", url_host, bucket, thread_num, iter)
+                req, _ := http.NewRequest("PUT", prefix, fileobj)
+                req.Header.Set("Content-Length", strconv.FormatUint(object_size, 10))
+                req.Header.Set("Content-MD5", object_data_md5)
+                setSignature(req)
+                if resp, err := httpClient.Do(req); err != nil {
+                        log.Fatalf("FATAL: Error uploading object %s: %v", prefix, err)
+                } else if resp != nil && resp.StatusCode != http.StatusOK {
+                        if (resp.StatusCode == http.StatusServiceUnavailable) {
+                                atomic.AddInt32(&upload_slowdown_count, 1)
+                                atomic.AddInt32(&upload_count, -1)
+                        } else {
+                                fmt.Printf("Upload status %s: resp: %+v\n", resp.Status, resp)
+                                if resp.Body != nil {
+                                        body, _ := ioutil.ReadAll(resp.Body)
+                                        fmt.Printf("Body: %s\n", string(body))
+                                }
+                        }
+                }
+          }
+
+        }  
 	// Remember last done time
 	upload_finish = time.Now()
 	// One less thread
@@ -236,9 +264,15 @@ func runUpload(thread_num int) {
 }
 
 func runDownload(thread_num int) {
-	for time.Now().Before(endtime) {
-		atomic.AddInt32(&download_count, 1)
-		objnum := rand.Int31n(download_count) + 1
+
+        if (num_ios == 0) {
+	  for time.Now().Before(endtime) {
+		//atomic.AddInt32(&download_count, 1)
+		objnum := rand.Int31n(upload_count)
+                if objnum == 0 {
+                        objnum = 1 
+                }
+
 		prefix := fmt.Sprintf("%s/%s/Object-%d", url_host, bucket, objnum)
 		req, _ := http.NewRequest("GET", prefix, nil)
 		setSignature(req)
@@ -252,7 +286,33 @@ func runDownload(thread_num int) {
 				io.Copy(ioutil.Discard, resp.Body)
 			}
 		}
-	}
+                atomic.AddInt32(&download_count, 1)
+          }
+	} else {
+          for iter := 0; iter < num_ios; iter++ {
+                
+                //atomic.AddInt32(&download_count, 1)
+                objnum := rand.Int31n(int32(num_ios))
+                if objnum == 0 {
+                        objnum = 1
+                }
+
+                prefix := fmt.Sprintf("%s/%s/Object-%d-%d", url_host, bucket, thread_num, objnum)
+                req, _ := http.NewRequest("GET", prefix, nil)
+                setSignature(req)
+                if resp, err := httpClient.Do(req); err != nil {
+                        log.Fatalf("FATAL: Error downloading object %s: %v", prefix, err)
+                } else if resp != nil && resp.Body != nil {
+                        if (resp.StatusCode == http.StatusServiceUnavailable){
+                                atomic.AddInt32(&download_slowdown_count, 1)
+                                atomic.AddInt32(&download_count, -1)
+                        } else {
+                                io.Copy(ioutil.Discard, resp.Body)
+                        }
+                }
+                atomic.AddInt32(&download_count, 1)
+          }
+        }  
 	// Remember last done time
 	download_finish = time.Now()
 	// One less thread
@@ -260,7 +320,9 @@ func runDownload(thread_num int) {
 }
 
 func runDelete(thread_num int) {
-	for {
+
+        if (num_ios == 0) {
+	  for {
 		objnum := atomic.AddInt32(&delete_count, 1)
 		if objnum > upload_count {
 			break
@@ -274,7 +336,23 @@ func runDelete(thread_num int) {
 			atomic.AddInt32(&delete_slowdown_count, 1)
 			atomic.AddInt32(&delete_count, -1)
 		}
-	}
+	  }
+        } else {
+
+          for iter := 0; iter < num_ios; iter++ {
+                atomic.AddInt32(&delete_count, 1)
+                prefix := fmt.Sprintf("%s/%s/Object-%d-%d", url_host, bucket, thread_num, iter)
+                req, _ := http.NewRequest("DELETE", prefix, nil)
+                setSignature(req)
+                if resp, err := httpClient.Do(req); err != nil {
+                        log.Fatalf("FATAL: Error deleting object %s: %v", prefix, err)
+                } else if (resp != nil && resp.StatusCode == http.StatusServiceUnavailable) {
+                        atomic.AddInt32(&delete_slowdown_count, 1)
+                        atomic.AddInt32(&delete_count, -1)
+                }
+          }
+
+        }
 	// Remember last done time
 	delete_finish = time.Now()
 	// One less thread
@@ -294,6 +372,8 @@ func main() {
 	myflag.StringVar(&region, "r", "us-east-1", "Region for testing")
 	myflag.IntVar(&duration_secs, "d", 60, "Duration of each test in seconds")
 	myflag.IntVar(&threads, "t", 1, "Number of threads to run")
+	myflag.IntVar(&num_ios, "n", 0, "Number of IOS per thread to run")
+	myflag.IntVar(&op_type, "o", 0, "Type of op, 1 = put, 2 = get, 3 = del")
 	myflag.IntVar(&loops, "l", 1, "Number of times to repeat test")
 	var sizeArg string
 	myflag.StringVar(&sizeArg, "z", "1M", "Size of objects in bytes with postfix K, M, and G")
@@ -308,14 +388,17 @@ func main() {
 	if secret_key == "" {
 		log.Fatal("Missing argument -s for secret key.")
 	}
+        if ((op_type < 0 ) || (op_type > 3)) {
+                log.Fatal("Wrong value for -o for op type, should be 1 = put, 2 = get, 3 = del.")
+        }
 	var err error
 	if object_size, err = bytefmt.ToBytes(sizeArg); err != nil {
 		log.Fatalf("Invalid -z argument for object size: %v", err)
 	}
 
 	// Echo the parameters
-	logit(fmt.Sprintf("Parameters: url=%s, bucket=%s, region=%s, duration=%d, threads=%d, loops=%d, size=%s",
-		url_host, bucket, region, duration_secs, threads, loops, sizeArg))
+	logit(fmt.Sprintf("Parameters: url=%s, bucket=%s, region=%s, duration=%d, threads=%d, num_ios=%d, op_type=%d, loops=%d, size=%s",
+		url_host, bucket, region, duration_secs, threads, num_ios, op_type, loops, sizeArg))
 
 	// Initialize data for the bucket
 	object_data = make([]byte, object_size)
@@ -326,7 +409,7 @@ func main() {
 
 	// Create the bucket and delete all the objects
 	createBucket(true)
-	deleteAllObjects()
+	//deleteAllObjects()
 
 	// Loop running the tests
 	for loop := 1; loop <= loops; loop++ {
@@ -339,58 +422,64 @@ func main() {
 		delete_count = 0
 		delete_slowdown_count = 0
 
-		// Run the upload case
-		running_threads = int32(threads)
-		starttime := time.Now()
-		endtime = starttime.Add(time.Second * time.Duration(duration_secs))
-		for n := 1; n <= threads; n++ {
+                if ((op_type == 0) || (op_type == 1)) {
+		  // Run the upload case
+		  running_threads = int32(threads)
+		  starttime := time.Now()
+		  endtime = starttime.Add(time.Second * time.Duration(duration_secs))
+		  for n := 1; n <= threads; n++ {
 			go runUpload(n)
-		}
+		  }
 
-		// Wait for it to finish
-		for atomic.LoadInt32(&running_threads) > 0 {
+		  // Wait for it to finish
+		  for atomic.LoadInt32(&running_threads) > 0 {
 			time.Sleep(time.Millisecond)
-		}
-		upload_time := upload_finish.Sub(starttime).Seconds()
+		  }
+		  upload_time := upload_finish.Sub(starttime).Seconds()
 
-		bps := float64(uint64(upload_count)*object_size) / upload_time
-		logit(fmt.Sprintf("Loop %d: PUT time %.1f secs, objects = %d, speed = %sB/sec, %.1f operations/sec. Slowdowns = %d",
-			loop, upload_time, upload_count, bytefmt.ByteSize(uint64(bps)), float64(upload_count)/upload_time, upload_slowdown_count))
+		  bps := float64(uint64(upload_count)*object_size) / upload_time
+		  logit(fmt.Sprintf("Loop %d: PUT time %.1f secs, objects = %d, speed = %sB/sec, %.1f operations/sec. Slowdowns = %d",
+		        loop, upload_time, upload_count, bytefmt.ByteSize(uint64(bps)), float64(upload_count)/upload_time, upload_slowdown_count))
+                }
 
-		// Run the download case
-		running_threads = int32(threads)
-		starttime = time.Now()
-		endtime = starttime.Add(time.Second * time.Duration(duration_secs))
-		for n := 1; n <= threads; n++ {
+                if ((op_type == 0) || (op_type == 2)) {
+		  // Run the download case
+		  running_threads = int32(threads)
+		  starttime := time.Now()
+		  endtime = starttime.Add(time.Second * time.Duration(duration_secs))
+		  for n := 1; n <= threads; n++ {
 			go runDownload(n)
-		}
+		  }
 
-		// Wait for it to finish
-		for atomic.LoadInt32(&running_threads) > 0 {
+		  // Wait for it to finish
+		  for atomic.LoadInt32(&running_threads) > 0 {
 			time.Sleep(time.Millisecond)
-		}
-		download_time := download_finish.Sub(starttime).Seconds()
+		  }
+		  download_time := download_finish.Sub(starttime).Seconds()
 
-		bps = float64(uint64(download_count)*object_size) / download_time
-		logit(fmt.Sprintf("Loop %d: GET time %.1f secs, objects = %d, speed = %sB/sec, %.1f operations/sec. Slowdowns = %d",
+		  bps := float64(uint64(download_count)*object_size) / download_time
+		  logit(fmt.Sprintf("Loop %d: GET time %.1f secs, objects = %d, speed = %sB/sec, %.1f operations/sec. Slowdowns = %d",
 			loop, download_time, download_count, bytefmt.ByteSize(uint64(bps)), float64(download_count)/download_time, download_slowdown_count))
+                }
 
-		// Run the delete case
-		running_threads = int32(threads)
-		starttime = time.Now()
-		endtime = starttime.Add(time.Second * time.Duration(duration_secs))
-		for n := 1; n <= threads; n++ {
+                if ((op_type == 0) || (op_type == 3)) {
+		  // Run the delete case
+		  running_threads = int32(threads)
+		  starttime := time.Now()
+		  endtime = starttime.Add(time.Second * time.Duration(duration_secs))
+		  for n := 1; n <= threads; n++ {
 			go runDelete(n)
-		}
+		  }
 
-		// Wait for it to finish
-		for atomic.LoadInt32(&running_threads) > 0 {
+		  // Wait for it to finish
+		  for atomic.LoadInt32(&running_threads) > 0 {
 			time.Sleep(time.Millisecond)
-		}
-		delete_time := delete_finish.Sub(starttime).Seconds()
+		  }
+		  delete_time := delete_finish.Sub(starttime).Seconds()
 
-		logit(fmt.Sprintf("Loop %d: DELETE time %.1f secs, %.1f deletes/sec. Slowdowns = %d",
-			loop, delete_time, float64(upload_count)/delete_time, delete_slowdown_count))
+		  logit(fmt.Sprintf("Loop %d: DELETE time %.1f secs, %.1f deletes/sec. Slowdowns = %d",
+			loop, delete_time, float64(delete_count)/delete_time, delete_slowdown_count))
+                }
 	}
 
 	// All done
